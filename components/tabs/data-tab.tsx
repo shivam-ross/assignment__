@@ -13,9 +13,10 @@ import { EditableTable } from '@/components/editable-table';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { FileUp, Download, Search, UploadCloud } from 'lucide-react';
+import { FileUp, Download, Search, UploadCloud, Bot } from 'lucide-react';
 import { toast } from 'sonner';
 import { AISuggestionPanel } from '../ai-suggestion-panel';
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 interface DataTabProps {
     clients: Client[];
@@ -35,14 +36,29 @@ const mapHeader = (header: string): string => {
     return map[normalized] || header;
 };
 
+// Server-side Gemini API call wrapper
+const callGeminiAPI = async (prompt: string): Promise<string> => {
+    try {
+        const genAI = new GoogleGenerativeAI(process.env.NEXT_PUBLIC_GEMINI_API_KEY || '');
+        const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+        const result = await model.generateContent(prompt);
+        const response = await result.response;
+        return response.text();
+    } catch (error: any) {
+        throw new Error(`Gemini API error: ${error.message}`);
+    }
+};
+
 export const DataTab: FC<DataTabProps> = ({ clients, workers, tasks, saveData, saveSingleDoc }) => {
     const [errors, setErrors] = useState<ValidationError[]>([]);
     const [aiSuggestions, setAiSuggestions] = useState<string[]>([]);
     const [searchTerms, setSearchTerms] = useState({ clients: '', workers: '', tasks: '' });
+    const [nlCommand, setNlCommand] = useState('');
+    const [isGenerating, setIsGenerating] = useState(false);
 
     const dataMap = { clients, workers, tasks };
 
-    const validateAllData = useCallback(() => {
+    const validateAllData = useCallback(async () => {
         const allErrors: ValidationError[] = [];
         const allSuggestions: string[] = [];
         const allTaskIds = new Set(tasks.map(t => t.TaskID));
@@ -96,9 +112,6 @@ export const DataTab: FC<DataTabProps> = ({ clients, workers, tasks, saveData, s
                     });
                 }
             });
-            if (c.PriorityLevel === 1 && (c.RequestedTaskIDs?.length || 0) > 5) {
-                allSuggestions.push(`Client ${c.ClientID} has the highest priority (1) but requests many tasks (${c.RequestedTaskIDs?.length}). This might be unusual.`);
-            }
         });
 
         // Validate workers
@@ -160,6 +173,22 @@ export const DataTab: FC<DataTabProps> = ({ clients, workers, tasks, saveData, s
                 });
             }
         });
+
+        // Gemini-powered suggestions for high-priority clients
+        try {
+            const highPriorityClients = clients.filter(c => c.PriorityLevel === 1 && (c.RequestedTaskIDs?.length || 0) > 5);
+            if (highPriorityClients.length > 0) {
+                setIsGenerating(true);
+                const prompt = `Analyze clients with PriorityLevel 1 and more than 5 requested tasks. Suggest optimizations in plain text, one per line.\nClients: ${JSON.stringify(highPriorityClients)}`;
+                const text = await callGeminiAPI(prompt);
+                const suggestions = text.split('\n').filter(Boolean);
+                allSuggestions.push(...suggestions);
+            }
+        } catch (error: any) {
+            toast.error(`Error generating AI suggestions: ${error.message}`);
+        } finally {
+            setIsGenerating(false);
+        }
 
         setErrors(allErrors);
         setAiSuggestions(allSuggestions);
@@ -226,9 +255,15 @@ export const DataTab: FC<DataTabProps> = ({ clients, workers, tasks, saveData, s
         const itemToUpdate = { ...dataSet[rowIndex] };
 
         if (['RequestedTaskIDs', 'Skills', 'RequiredSkills', 'CoRunTaskIDs', 'AvailableSlots', 'PreferredPhases'].includes(field)) {
-            itemToUpdate[field as keyof typeof itemToUpdate] = String(value).split(',').map(s => s.trim()).filter(Boolean).join(',');
+            const arrValue = String(value).split(',').map(s => s.trim()).filter(Boolean);
+            // If the original field is a string, join the array back to a string
+            if (typeof itemToUpdate[field as keyof typeof itemToUpdate] === 'string') {
+                itemToUpdate[field as keyof typeof itemToUpdate] = arrValue.join(', ') as any;
+            } else {
+                itemToUpdate[field as keyof typeof itemToUpdate] = arrValue as any;
+            }
         } else if (['PriorityLevel', 'Duration', 'MaxLoadPerPhase', 'MaxConcurrent'].includes(field)) {
-            itemToUpdate[field as keyof typeof itemToUpdate] = (parseInt(String(value), 10) || 0).toString();
+            itemToUpdate[field as keyof typeof itemToUpdate] = String(parseInt(String(value), 10) || 0);
         } else {
             itemToUpdate[field as keyof typeof itemToUpdate] = value;
         }
@@ -241,6 +276,123 @@ export const DataTab: FC<DataTabProps> = ({ clients, workers, tasks, saveData, s
         setSearchTerms(prev => ({ ...prev, [entityType]: term }));
     };
 
+    const handleNaturalLanguageModify = async () => {
+        if (!nlCommand) return;
+        setIsGenerating(true);
+        try {
+            const prompt = `Parse the command to identify the entity (client, worker, task), ID, field, and value. Return a JSON object with entityType, id, field, and value.\nCommand: ${nlCommand}\nData: ${JSON.stringify({ clients, workers, tasks })}`;
+            const text = await callGeminiAPI(prompt);
+
+            let resultObj;
+            try {
+                resultObj = JSON.parse(text);
+            } catch {
+                const jsonMatch = text.match(/```json\n([\s\S]*?)\n```/);
+                if (jsonMatch) {
+                    resultObj = JSON.parse(jsonMatch[1]);
+                } else {
+                    throw new Error('Invalid AI response format');
+                }
+            }
+
+            const { entityType, id, field, value } = resultObj as { entityType: string; id: string; field: string; value: any };
+            if (!entityType || !id || !field || value === undefined) {
+                toast.error('Invalid command. Use format: Set [entity] [ID] [field] to [value], e.g., "Set Client C1 PriorityLevel to 3"');
+                return;
+            }
+
+            const entityMap: { [key: string]: EntityType } = { client: 'clients', worker: 'workers', task: 'tasks' };
+            const mappedEntityType = entityMap[entityType.toLowerCase()];
+            if (!mappedEntityType) {
+                toast.error(`Invalid entity type: ${entityType}`);
+                return;
+            }
+
+            const dataSet = dataMap[mappedEntityType];
+            const idKey = `${entityType.charAt(0).toUpperCase() + entityType.slice(1)}ID`;
+            const item = dataSet.find(row => (row as any)[idKey] === id);
+
+            if (!item) {
+                toast.error(`${entityType} with ID ${id} not found.`);
+                return;
+            }
+
+            const updatedItem = { ...item };
+            if (['RequestedTaskIDs', 'Skills', 'RequiredSkills', 'CoRunTaskIDs', 'AvailableSlots', 'PreferredPhases'].includes(field)) {
+                if (typeof updatedItem[field as keyof typeof updatedItem] === 'string') {
+                    updatedItem[field as keyof typeof updatedItem] = String(value).split(',').map((s: string) => s.trim()).filter(Boolean).join(', ') as any;
+                } else {
+                    updatedItem[field as keyof typeof updatedItem] = String(value).split(',').map((s: string) => s.trim()).filter(Boolean) as any;
+                }
+            } else if (['PriorityLevel', 'MaxLoadPerPhase', 'MaxConcurrent', 'Duration'].includes(field)) {
+                updatedItem[field as keyof typeof updatedItem] = String(parseInt(String(value), 10) || 0);
+            } else {
+                updatedItem[field as keyof typeof updatedItem] = value;
+            }
+
+            await saveSingleDoc(mappedEntityType, updatedItem);
+            setNlCommand('');
+            validateAllData();
+            toast.success(`Successfully updated ${entityType} ${id}`);
+        } catch (error: any) {
+            toast.error(`Error modifying data: ${error.message}`);
+        } finally {
+            setIsGenerating(false);
+        }
+    };
+
+    const applyAIFix = async (entityType: EntityType, id: string, field: string, suggestion: string) => {
+        setIsGenerating(true);
+        try {
+            const prompt = `Validate and format the suggestion for the given entity, ID, and field. Return the validated value as plain text.\nEntity: ${entityType}, ID: ${id}, Field: ${field}, Suggestion: ${suggestion}`;
+            const validatedSuggestion = await callGeminiAPI(prompt);
+
+            const dataSet = dataMap[entityType];
+            const idKey = `${entityType.slice(0, -1).charAt(0).toUpperCase() + entityType.slice(1, -1)}ID`;
+            const item = dataSet.find(row => (row as any)[idKey] === id);
+            if (!item) {
+                toast.error(`${entityType} with ID ${id} not found.`);
+                return;
+            }
+
+            const updatedItem = { ...item };
+            if (['RequestedTaskIDs', 'Skills', 'RequiredSkills', 'CoRunTaskIDs', 'AvailableSlots', 'PreferredPhases'].includes(field)) {
+                const arrValue = validatedSuggestion.split(',').map((s: string) => s.trim()).filter(Boolean);
+                if (typeof updatedItem[field as keyof typeof updatedItem] === 'string') {
+                    updatedItem[field as keyof typeof updatedItem] = arrValue.join(', ') as any;
+                } else {
+                    updatedItem[field as keyof typeof updatedItem] = arrValue as any;
+                }
+            } else if (['PriorityLevel', 'MaxLoadPerPhase', 'MaxConcurrent', 'Duration'].includes(field)) {
+                updatedItem[field as keyof typeof updatedItem] = String(parseInt(validatedSuggestion, 10) || 0);
+            } else {
+                updatedItem[field as keyof typeof updatedItem] = validatedSuggestion;
+            }
+
+            await saveSingleDoc(entityType, updatedItem);
+            validateAllData();
+            toast.success(`Applied fix for ${entityType} ${id}`);
+        } catch (error: any) {
+            toast.error(`Error applying AI fix: ${error.message}`);
+        } finally {
+            setIsGenerating(false);
+        }
+    };
+
+    const generateRuleRecommendations = async () => {
+        setIsGenerating(true);
+        try {
+            const prompt = `Analyze client data for task co-occurrences and suggest rules in the format: "If task X is assigned, then assign task Y to the same worker." Return one rule per line.\nClients: ${JSON.stringify(clients)}`;
+            const text = await callGeminiAPI(prompt);
+            return text.split('\n').filter(Boolean);
+        } catch (error: any) {
+            toast.error(`Error generating rule recommendations: ${error.message}`);
+            return [];
+        } finally {
+            setIsGenerating(false);
+        }
+    };
+
     const dataSections = [
         { title: 'Clients', entityType: 'clients' as EntityType, data: clients, onDrop: (files: File[]) => onDrop(files, 'clients') },
         { title: 'Workers', entityType: 'workers' as EntityType, data: workers, onDrop: (files: File[]) => onDrop(files, 'workers') },
@@ -249,8 +401,26 @@ export const DataTab: FC<DataTabProps> = ({ clients, workers, tasks, saveData, s
 
     return (
         <div className="space-y-6 mt-6">
-            <ValidationPanel errors={errors} />
+            <ValidationPanel errors={errors} onFix={applyAIFix} />
             <AISuggestionPanel suggestions={aiSuggestions} />
+            <Card>
+                <CardHeader>
+                    <CardTitle>Natural Language Data Modification</CardTitle>
+                    <CardDescription>Modify data using plain English commands.</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                    <Input
+                        value={nlCommand}
+                        onChange={e => setNlCommand(e.target.value)}
+                        placeholder="e.g., Set Client C1 PriorityLevel to 3 or Add skill Python to Worker W1"
+                        disabled={isGenerating}
+                    />
+                    <Button onClick={handleNaturalLanguageModify} disabled={isGenerating}>
+                        <Bot className="mr-2 h-4 w-4" />
+                        {isGenerating ? 'Processing...' : 'Apply Command'}
+                    </Button>
+                </CardContent>
+            </Card>
             {dataSections.map(({ title, entityType, data, onDrop: dropHandler }) => {
                 const { getRootProps, getInputProps, isDragActive } = useDropzone({
                     onDrop: dropHandler,
@@ -271,11 +441,12 @@ export const DataTab: FC<DataTabProps> = ({ clients, workers, tasks, saveData, s
                             <div className="relative mt-4">
                                 <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
                                 <Input
-                                 type="search"
-                                 placeholder={`Search ${title.toLowerCase()} (e.g., "duration > 5" or "phase 2")...`}
-                                 className="w-full pl-8"
-                                 value={searchTerms[entityType]}
-                                 onChange={(e) => handleSearch(entityType, e.target.value)}
+                                    type="search"
+                                    placeholder={`Search ${title.toLowerCase()} (e.g., "duration > 5" or "phase 2")...`}
+                                    className="w-full pl-8"
+                                    value={searchTerms[entityType]}
+                                    onChange={(e) => handleSearch(entityType, e.target.value)}
+                                    disabled={isGenerating}
                                 />
                             </div>
                         </CardHeader>
